@@ -1252,17 +1252,59 @@ impl StateStore {
             return Ok(());
         };
         let stored = serde_json::from_str::<AgentSession>(&data).map_err(to_io_error)?;
-        session.transcript_blocks = stored.transcript_blocks;
-        session.turns = stored.turns;
-        session.queued_messages = stored.queued_messages;
-        session.workspace = stored.workspace;
-        session.provider_cursor = stored.provider_cursor;
-        session.runtime_mode = stored.runtime_mode;
-        session.reasoning_effort = stored.reasoning_effort;
-        session.service_tier = stored.service_tier;
-        session.context_window = stored.context_window;
-        session.context_usage = stored.context_usage;
-        session.runtime_event_cursor = stored.runtime_event_cursor;
+        // Exhaustive on purpose: a new field fails to compile here until it is
+        // sorted into one of the groups below. A blob field that is not
+        // restored stays at its skeleton default, and the next save of this
+        // session then writes that default over the stored value.
+        let AgentSession {
+            // List columns: the skeleton already holds them, and they may have
+            // changed in memory since load.
+            id: _,
+            title: _,
+            auto_title: _,
+            project_id: _,
+            provider: _,
+            model: _,
+            status: _,
+            created_at: _,
+            updated_at: _,
+            last_reply_at: _,
+            // Never in the blob: `messages` are rows (read below),
+            // `provider_session_id` is not serialized, and `detail_loaded` is
+            // process state.
+            messages: _,
+            provider_session_id: _,
+            detail_loaded: _,
+            // Everything else lives only in the blob.
+            workspace,
+            runtime_mode,
+            reasoning_effort,
+            service_tier,
+            context_window,
+            agent_preset,
+            provider_cursor,
+            available_commands,
+            thread_goal,
+            context_usage,
+            runtime_event_cursor,
+            transcript_blocks,
+            turns,
+            queued_messages,
+        } = stored;
+        session.workspace = workspace;
+        session.runtime_mode = runtime_mode;
+        session.reasoning_effort = reasoning_effort;
+        session.service_tier = service_tier;
+        session.context_window = context_window;
+        session.agent_preset = agent_preset;
+        session.provider_cursor = provider_cursor;
+        session.available_commands = available_commands;
+        session.thread_goal = thread_goal;
+        session.context_usage = context_usage;
+        session.runtime_event_cursor = runtime_event_cursor;
+        session.transcript_blocks = transcript_blocks;
+        session.turns = turns;
+        session.queued_messages = queued_messages;
 
         let mut statement = connection
             .prepare(
@@ -1539,7 +1581,8 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         workspace: SessionWorkspace::Local,
         provider: serde_json::from_value(serde_json::Value::String(provider)).ok()?,
         model,
-        // Hydration replaces these; the list never reads them.
+        // Hydration replaces these and every other blob-only field below; the
+        // list never reads them.
         runtime_mode: RuntimeMode::default(),
         reasoning_effort: None,
         service_tier: None,
@@ -1835,6 +1878,57 @@ mod tests {
             directory.join("app.json"),
             vec![directory.join("settings.json")],
         )
+    }
+
+    /// Every field the `data` blob carries must survive `load` + `hydrate`,
+    /// and must still be there after the hydrated session is saved again —
+    /// that second save is what erases a dropped field for good.
+    #[test]
+    fn hydrate_restores_every_persisted_session_setting_across_a_resave() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let id = state.sessions[0].id;
+        let session = &mut state.sessions[0];
+        session.begin_turn("Ask");
+        session.push_message(MessageRole::Assistant, "an answer");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+        session.agent_preset = Some("deep".into());
+        session.available_commands = serde_json::from_value(serde_json::json!([
+            {"name": "review", "description": "Review the diff"}
+        ]))
+        .unwrap();
+        session.thread_goal = Some(
+            serde_json::from_value(serde_json::json!({
+                "objective": "Ship it",
+                "status": "active"
+            }))
+            .unwrap(),
+        );
+        let settings = |session: &AgentSession| {
+            serde_json::json!({
+                "agent_preset": session.agent_preset,
+                "available_commands": session.available_commands,
+                "thread_goal": session.thread_goal,
+            })
+        };
+        let expected = settings(session);
+        store.save(&mut state).unwrap();
+
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load().unwrap();
+        reopened.hydrate(&mut restored.sessions[0]).unwrap();
+        assert_eq!(settings(&restored.sessions[0]), expected);
+
+        // Saving the hydrated session again must write the same values back.
+        restored.mark_session_dirty(id);
+        reopened.save(&mut restored).unwrap();
+        let again = store_in(&directory);
+        let mut restored = again.load().unwrap();
+        again.hydrate(&mut restored.sessions[0]).unwrap();
+        assert_eq!(settings(&restored.sessions[0]), expected);
+
+        fs::remove_dir_all(directory).ok();
     }
 
     /// `load` returns list-only sessions by design; tests that assert on
